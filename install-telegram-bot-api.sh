@@ -12,6 +12,7 @@
 # - Интерактивный запрос директории для установки
 # - Интерактивный запрос настроек конфигурации
 # - Интерактивный запрос api_id и api_hash
+# - Поддержка щадящего режима сборки для маломощных серверов
 # - Создание необходимой структуры директорий
 # - Настройка прав доступа и владельцев файлов
 # - Создание и настройка systemd службы с ограничениями безопасности
@@ -63,6 +64,8 @@ DEFAULT_API_PORT=8081
 DEFAULT_SERVICE_NAME="telegram-bot-api"
 DEFAULT_SERVICE_USER="telegram-bot-api"
 DEFAULT_SRC_DIR="/usr/local/src/telegram-bot-api"
+DEFAULT_BUILD_JOBS="auto"
+DEFAULT_LOW_POWER_BUILD="no"
 REPO_URL="https://github.com/tdlib/telegram-bot-api.git"
 
 # -----------------------------------------------------------------------------
@@ -126,6 +129,33 @@ read_config_value() {
 				exit
 			}' "$file" || true
 	fi
+}
+
+normalize_yes_no() {
+	local val="${1:-}"
+	val="${val,,}"
+	case "$val" in
+		y|yes|1|true|on|да) printf "yes" ;;
+		*) printf "no" ;;
+	esac
+}
+
+normalize_build_jobs() {
+	local val="${1:-}"
+	if [[ -z "$val" ]]; then
+		printf "auto"
+		return 0
+	fi
+	val="${val,,}"
+	if [[ "$val" == "auto" ]]; then
+		printf "auto"
+		return 0
+	fi
+	if [[ "$val" =~ ^[1-9][0-9]*$ ]]; then
+		printf "%s" "$val"
+		return 0
+	fi
+	printf "auto"
 }
 
 save_config() {
@@ -383,11 +413,15 @@ if [[ -f "$CONFIG_FILE" ]]; then
 	cfg_service_name=$(read_config_value "SERVICE_NAME" "$CONFIG_FILE" || true)
 	cfg_service_user=$(read_config_value "SERVICE_USER" "$CONFIG_FILE" || true)
 	cfg_src_dir=$(read_config_value "SRC_DIR" "$CONFIG_FILE" || true)
+	cfg_build_jobs=$(read_config_value "BUILD_JOBS" "$CONFIG_FILE" || true)
+	cfg_low_power_build=$(read_config_value "LOW_POWER_BUILD" "$CONFIG_FILE" || true)
 
 	API_PORT="${cfg_api_port:-$DEFAULT_API_PORT}"
 	SERVICE_NAME="${cfg_service_name:-$DEFAULT_SERVICE_NAME}"
 	SERVICE_USER="${cfg_service_user:-$DEFAULT_SERVICE_USER}"
 	SRC_DIR="${cfg_src_dir:-$DEFAULT_SRC_DIR}"
+	BUILD_JOBS="$(normalize_build_jobs "${cfg_build_jobs:-$DEFAULT_BUILD_JOBS}")"
+	LOW_POWER_BUILD="$(normalize_yes_no "${cfg_low_power_build:-$DEFAULT_LOW_POWER_BUILD}")"
 else
 	read -r -p "Подтвердите порт для запуска Telegram Bot API или введите другой [${DEFAULT_API_PORT}]: " input_port
 	API_PORT="${input_port:-$DEFAULT_API_PORT}"
@@ -397,6 +431,15 @@ else
 	SERVICE_USER="${input_user:-$DEFAULT_SERVICE_USER}"
 	read -r -p "Подтвердите директорию для загрузки исходников Telegram Bot API или введите другую [${DEFAULT_SRC_DIR}]: " input_src
 	SRC_DIR="${input_src:-$DEFAULT_SRC_DIR}"
+	read -r -p "Включить щадящий режим сборки для маломощных серверов? (y/N): " input_low_power
+	LOW_POWER_BUILD="$(normalize_yes_no "${input_low_power:-N}")"
+	if [[ "$LOW_POWER_BUILD" == "yes" ]]; then
+		recommended_jobs=1
+	else
+		recommended_jobs="auto"
+	fi
+	read -r -p "Потоки компиляции (число или auto) [${recommended_jobs}]: " input_build_jobs
+	BUILD_JOBS="$(normalize_build_jobs "${input_build_jobs:-$recommended_jobs}")"
 fi
 
 SERVICE_GROUP="${SERVICE_USER}"
@@ -419,6 +462,22 @@ fi
 if [[ -z "${SRC_DIR:-}" ]]; then
 	read -r -p "Директорию для загрузки исходников Telegram Bot API не указана. Пожалуйста, введите директорию для загрузки исходников (рекомендуется: ${DEFAULT_SRC_DIR}): " SRC_DIR
 fi
+if [[ -z "${LOW_POWER_BUILD:-}" ]]; then
+	read -r -p "Включить щадящий режим сборки для маломощных серверов? (y/N): " input_low_power
+	LOW_POWER_BUILD="$(normalize_yes_no "${input_low_power:-N}")"
+fi
+if [[ -z "${BUILD_JOBS:-}" ]]; then
+	if [[ "$LOW_POWER_BUILD" == "yes" ]]; then
+		recommended_jobs=1
+	else
+		recommended_jobs="auto"
+	fi
+	read -r -p "Потоки компиляции (число или auto) [${recommended_jobs}]: " input_build_jobs
+	BUILD_JOBS="$(normalize_build_jobs "${input_build_jobs:-$recommended_jobs}")"
+fi
+if [[ "$LOW_POWER_BUILD" == "yes" && "$BUILD_JOBS" == "auto" ]]; then
+	BUILD_JOBS=1
+fi
 
 # -----------------------------------------------------------------------------
 # Сохранение настроек в конфигурационный файл
@@ -429,7 +488,9 @@ save_config "$CONFIG_FILE" \
 	"API_PORT=${API_PORT}" \
 	"SERVICE_NAME=${SERVICE_NAME}" \
 	"SERVICE_USER=${SERVICE_USER}" \
-	"SRC_DIR=${SRC_DIR}"
+	"SRC_DIR=${SRC_DIR}" \
+	"BUILD_JOBS=${BUILD_JOBS}" \
+	"LOW_POWER_BUILD=${LOW_POWER_BUILD}"
 
 # -----------------------------------------------------------------------------
 # Подготовка окружения
@@ -446,6 +507,8 @@ log "API_PORT=${API_PORT}"
 log "SERVICE_NAME=${SERVICE_NAME}"
 log "SERVICE_USER=${SERVICE_USER}"
 log "SRC_DIR=${SRC_DIR}"
+log "BUILD_JOBS=${BUILD_JOBS}"
+log "LOW_POWER_BUILD=${LOW_POWER_BUILD}"
 
 # -----------------------------------------------------------------------------
 # Проверка и создание системного пользователя
@@ -521,8 +584,12 @@ log "Зависимости установлены."
 # Проверка доступности порта
 # -----------------------------------------------------------------------------
 while true; do
-	pidinfo=$(port_check "$API_PORT" "$SERVICE_NAME" || true)
-	rc=$?
+	pidinfo=""
+	if pidinfo=$(port_check "$API_PORT" "$SERVICE_NAME"); then
+		rc=0
+	else
+		rc=$?
+	fi
 	if [[ $rc -eq 0 ]]; then
 		log "Порт $API_PORT свободен."
 		break
@@ -536,13 +603,15 @@ while true; do
 		if [[ "$yn" =~ ^[Yy]$ ]]; then
 			read -r -p "Новый порт: " newport
 			API_PORT="${newport:-$API_PORT}"
-			save_config "$CONFIG_FILE" \
-				"INSTALL_DIR=${INSTALL_DIR}" \
-				"API_PORT=${API_PORT}" \
-				"SERVICE_NAME=${SERVICE_NAME}" \
-				"SERVICE_USER=${SERVICE_USER}" \
-				"SRC_DIR=${SRC_DIR}"
-			continue
+				save_config "$CONFIG_FILE" \
+					"INSTALL_DIR=${INSTALL_DIR}" \
+					"API_PORT=${API_PORT}" \
+					"SERVICE_NAME=${SERVICE_NAME}" \
+					"SERVICE_USER=${SERVICE_USER}" \
+					"SRC_DIR=${SRC_DIR}" \
+					"BUILD_JOBS=${BUILD_JOBS}" \
+					"LOW_POWER_BUILD=${LOW_POWER_BUILD}"
+				continue
 		else
 			log "Операция прервана пользователем из-за занятого порта: $API_PORT."
 			exit 1
@@ -573,8 +642,27 @@ mkdir -p build && cd build
 log "Конфигурация CMake..."
 run_and_watch "cmake configure" env CXXFLAGS="-stdlib=libc++" CC=/usr/bin/clang CXX=/usr/bin/clang++ cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=.. .. || { log "cmake configure FAILED"; exit 1; }
 CPU_COUNT=$(nproc || echo 1)
-log "Компиляция (потоков: $CPU_COUNT)..."
-run_and_watch "cmake --build" cmake --build . --target install -- -j"${CPU_COUNT}" || { log "cmake --build FAILED"; exit 1; }
+if [[ "$BUILD_JOBS" == "auto" ]]; then
+	if [[ "$LOW_POWER_BUILD" == "yes" ]]; then
+		BUILD_JOBS_EFFECTIVE=1
+	else
+		BUILD_JOBS_EFFECTIVE="$CPU_COUNT"
+	fi
+else
+	BUILD_JOBS_EFFECTIVE="$BUILD_JOBS"
+fi
+
+if [[ "$LOW_POWER_BUILD" == "yes" ]]; then
+	log "Щадящий режим сборки включён: nice + ionice, потоков: $BUILD_JOBS_EFFECTIVE."
+	if command -v ionice >/dev/null 2>&1; then
+		run_and_watch "cmake --build (low-power)" nice -n 15 ionice -c2 -n7 cmake --build . --target install -- -j"${BUILD_JOBS_EFFECTIVE}" || { log "cmake --build FAILED"; exit 1; }
+	else
+		run_and_watch "cmake --build (low-power)" nice -n 15 cmake --build . --target install -- -j"${BUILD_JOBS_EFFECTIVE}" || { log "cmake --build FAILED"; exit 1; }
+	fi
+else
+	log "Компиляция (потоков: $BUILD_JOBS_EFFECTIVE)..."
+	run_and_watch "cmake --build" cmake --build . --target install -- -j"${BUILD_JOBS_EFFECTIVE}" || { log "cmake --build FAILED"; exit 1; }
+fi
 popd >/dev/null
 
 # -----------------------------------------------------------------------------
@@ -587,16 +675,16 @@ fi
 chmod +x "$SRC_DIR/bin/telegram-bot-api" || true
 
 # -----------------------------------------------------------------------------
-# Остановка службы (если существует и запущена)
+# Отключение автозапуска службы (если юнит существует и enabled)
 # -----------------------------------------------------------------------------
 WAS_ENABLED=0
 if unit_exists "$SERVICE_NAME"; then
 	if unit_is_enabled "$SERVICE_NAME"; then
 		WAS_ENABLED=1
-		log "Служба ${SERVICE_NAME} запущена — отключение автозапуска службы..."
+		log "Для службы ${SERVICE_NAME} включён автозапуск — временное отключение..."
 		run_and_watch "Отключение службы" systemctl disable "$SERVICE_NAME" || true
 	else
-		log "Служба ${SERVICE_NAME} не запущена."
+		log "Для службы ${SERVICE_NAME} автозапуск уже отключён."
 	fi
 else
 	log "Служба ${SERVICE_NAME} не существует (новая установка)."
