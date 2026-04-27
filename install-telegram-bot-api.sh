@@ -584,10 +584,12 @@ log "Зависимости установлены."
 # Проверка доступности порта
 # -----------------------------------------------------------------------------
 while true; do
-	set +e
-	pidinfo=$(port_check "$API_PORT" "$SERVICE_NAME")
-	rc=$?
-	set -e
+	pidinfo=""
+	if pidinfo=$(port_check "$API_PORT" "$SERVICE_NAME"); then
+		rc=0
+	else
+		rc=$?
+	fi
 	if [[ $rc -eq 0 ]]; then
 		log "Порт $API_PORT свободен."
 		break
@@ -601,15 +603,15 @@ while true; do
 		if [[ "$yn" =~ ^[Yy]$ ]]; then
 			read -r -p "Новый порт: " newport
 			API_PORT="${newport:-$API_PORT}"
-				save_config "$CONFIG_FILE" \
-					"INSTALL_DIR=${INSTALL_DIR}" \
-					"API_PORT=${API_PORT}" \
-					"SERVICE_NAME=${SERVICE_NAME}" \
-					"SERVICE_USER=${SERVICE_USER}" \
-					"SRC_DIR=${SRC_DIR}" \
-					"BUILD_JOBS=${BUILD_JOBS}" \
-					"LOW_POWER_BUILD=${LOW_POWER_BUILD}"
-				continue
+			save_config "$CONFIG_FILE" \
+				"INSTALL_DIR=${INSTALL_DIR}" \
+				"API_PORT=${API_PORT}" \
+				"SERVICE_NAME=${SERVICE_NAME}" \
+				"SERVICE_USER=${SERVICE_USER}" \
+				"SRC_DIR=${SRC_DIR}" \
+				"BUILD_JOBS=${BUILD_JOBS}" \
+				"LOW_POWER_BUILD=${LOW_POWER_BUILD}"
+			continue
 		else
 			log "Операция прервана пользователем из-за занятого порта: $API_PORT."
 			exit 1
